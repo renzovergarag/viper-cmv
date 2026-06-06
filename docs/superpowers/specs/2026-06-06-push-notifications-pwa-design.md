@@ -25,18 +25,18 @@ Se reutiliza el flujo actual de creación de eventos y se añade un canal de ent
 ```
 Admin crea evento
    └─ POST /api/events (web)  ── escribe en MongoDB
-        └─ POST → socket-server /internal/events
-              ├─ io.emit("evento:nuevo")        → clientes con app ABIERTA (modal rico actual, sin cambios)
-              └─ [NUEVO] fan-out Web Push        → TODOS los agentes con suscripción (app cerrada/bloqueada)
-                    └─ servicio push del navegador (FCM/Apple/Mozilla)
-                         └─ Service Worker del agente → muestra notificación + vibración
+        ├─ POST → socket-server /internal/events
+        │     └─ io.emit("evento:nuevo")        → clientes con app ABIERTA (modal rico actual, sin cambios)
+        └─ [NUEVO] fan-out Web Push (fire-and-forget) → TODOS los agentes con suscripción (app cerrada/bloqueada)
+              └─ servicio push del navegador (FCM/Apple/Mozilla)
+                   └─ Service Worker del agente → muestra notificación + vibración
 ```
 
 ### División de responsabilidades
 
-- **Envío del push:** vive en el **socket-server** (`/internal/events`), que ya es el hub de notificaciones y ya recibe el evento. Lee las suscripciones de Mongo vía Prisma (que ya usa) y envía con `web-push`. La **clave VAPID privada** vive solo aquí.
+- **Envío del push:** vive en la **web app**, dentro de `POST /api/events`, tras crear el evento y avisar al socket-server. Decisión basada en un hallazgo de la base de código: el `socket-server` **no instancia `PrismaClient` en runtime** — está desacoplado de la DB y solo habla con ella vía la API web (`api-client.ts`). Poner el fan-out en web es consistente con "web es dueña de la base de datos": el route ya creó el evento con Prisma y ya tiene acceso a las suscripciones. El envío es **fire-and-forget** (no bloquea ni puede hacer fallar la creación del evento). La librería `web-push` y la **clave VAPID privada** viven en la web app. El `socket-server` queda **intacto**.
 - **Registro/baja de suscripciones:** API routes en **web**, autenticadas por la cookie JWT (`/api/push/subscribe`, `/api/push/unsubscribe`), porque el cliente habla con la web app y `nginx` bloquea las rutas internas del socket-server.
-- **Clave VAPID pública:** se expone al cliente vía `NEXT_PUBLIC_VAPID_PUBLIC_KEY` (mismo valor que la pública del socket-server; no es secreto).
+- **Clave VAPID pública:** se expone al cliente vía `NEXT_PUBLIC_VAPID_PUBLIC_KEY` (mismo valor que la pública; no es secreto).
 
 ## Modelo de datos
 
@@ -63,7 +63,7 @@ suscripcionesPush SuscripcionPush[] @relation("SuscripcionesPush")
 ```
 
 - `endpoint @unique` permite hacer **upsert** (re-suscribir el mismo dispositivo no duplica).
-- El schema Prisma está **duplicado** en `apps/web/prisma/schema.prisma` y `services/socket-server/prisma/schema.prisma`; el modelo se agrega en **ambos** y se regenera el cliente en los dos.
+- El modelo se agrega a `apps/web/prisma/schema.prisma` (donde sí se usa Prisma en runtime) y se regenera el cliente. El schema del socket-server se mantiene espejado por convención del repo, pero el socket-server **no** lee este modelo en runtime.
 
 ## Cliente: Service Worker, manifest y onboarding
 
@@ -95,9 +95,9 @@ suscripcionesPush SuscripcionPush[] @relation("SuscripcionesPush")
 
 ## Servidor: VAPID y envío del push
 
-- **Dependencia:** `web-push` en `services/socket-server`.
-- **Config VAPID** desde env (`VAPID_PUBLIC_KEY`, `VAPID_PRIVATE_KEY`, `VAPID_SUBJECT=mailto:...`), inicializada al arrancar el socket-server.
-- En `/internal/events`, tras `io.emit`, fan-out push **desacoplado de la respuesta HTTP**:
+- **Dependencia:** `web-push` en `apps/web`.
+- **Config VAPID** desde env (`VAPID_PUBLIC_KEY`, `VAPID_PRIVATE_KEY`, `VAPID_SUBJECT=mailto:...`), inicializada en un módulo `lib/push.ts` de la web app.
+- En `POST /api/events`, tras crear el evento y avisar al socket-server, fan-out push **fire-and-forget** (no se hace `await` que pueda bloquear/fallar la respuesta):
   1. `prisma.suscripcionPush.findMany()`.
   2. Por cada suscripción, `webpush.sendNotification(sub, JSON.stringify(payload))` con payload:
      `{ title: "Nuevo evento", body: "<titulo> – <direccionExacta>", eventoId, url: "/dashboard/agent?evento=<id>" }`.
@@ -127,15 +127,14 @@ Con la app **abierta** se mantiene la alarma fuerte actual de 4.5s (Web Audio). 
 ## Configuración (env) y claves
 
 - Generar una vez: `npx web-push generate-vapid-keys`.
-- **services/socket-server/.env:** `VAPID_PUBLIC_KEY`, `VAPID_PRIVATE_KEY`, `VAPID_SUBJECT`.
-- **apps/web/.env** (y raíz): `NEXT_PUBLIC_VAPID_PUBLIC_KEY` (= public key).
+- **apps/web/.env** (y raíz): `VAPID_PUBLIC_KEY`, `VAPID_PRIVATE_KEY`, `VAPID_SUBJECT`, y `NEXT_PUBLIC_VAPID_PUBLIC_KEY` (= public key, expuesta al cliente).
 - Actualizar `.env.example` y la sección de variables de `AGENTS.md`.
 
 ## Pruebas
 
 No hay framework de tests en el repo; el énfasis es QA manual en dispositivos reales.
 
-- **Script** `services/socket-server/scripts/send-test-push.ts`: dispara un push de prueba a un agente para validar end-to-end sin crear eventos reales.
+- **Script** `apps/web/scripts/send-test-push.ts`: dispara un push de prueba a un agente para validar end-to-end sin crear eventos reales.
 - **Checklist de QA manual:**
   - Android Chrome, app cerrada / pantalla bloqueada → llega heads-up + vibración + persistente.
   - iPhone Safari instalado (iOS 16.4+), app cerrada → llega banner + sonido estándar.
